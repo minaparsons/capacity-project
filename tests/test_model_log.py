@@ -4,7 +4,7 @@ import pytest
 
 from src.demand import LOG_COLUMNS, choose_model, forecast_demand, run_monthly_forecast
 
-MAE = {"naive": 10.0, "seasonal_naive": 8.0, "linear_trend": 12.0, "damped_ets": 9.5}
+MAE = {"naive": 10.0, "seasonal_naive": 8.0,"damped_ets": 9.5}
 
 
 def history(n=22, start="2025-01-01"):
@@ -57,6 +57,19 @@ def test_first_run_creates_log_with_header(tmp_path):
     assert len(log) == 1
     assert log.loc[0, "last_month"] == "2026-10"
     assert log.loc[0, "model"] == result.best_by_mae == result.model
+
+
+def test_log_records_forecast_and_settings(tmp_path):
+    log_path = tmp_path / "model_log.csv"
+    result = run_monthly_forecast(history(), h=1, series_name="maths_0", log_path=log_path,
+                                  coverage=0.9, switch_margin=0.2)
+
+    row = pd.read_csv(log_path).iloc[0]
+    for column in ("forecast", "lower", "upper"):
+        assert row[column] == pytest.approx(result.forecast[column].iloc[0])
+    assert row["coverage"] == 0.9
+    assert row["switch_margin"] == 0.2
+    assert row["n_windows"] == 7  # 22 months, growth model eligible: origins 15..21
 
 
 def test_next_month_uses_previous_model(tmp_path):

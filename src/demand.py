@@ -1,27 +1,18 @@
 
 #for working out predicted demand
-import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from statsmodels.tools.sm_exceptions import ConvergenceWarning
-from statsmodels.tsa.holtwinters import ExponentialSmoothing
+from statsforecast.models import AutoETS, Naive, SeasonalNaive
 
 SEASON_LENGTH = 12
 MIN_TRAIN = 12  # one full season: the least seasonal_naive needs
 MIN_WINDOWS = 6  # backtest windows a model needing extra history must get before it is compared
 MIN_GROWTH_PAIRS = 3  # matched year-on-year months needed to estimate growth
-
-
-@dataclass
-class Demand:
-    demand: dict = field(default_factory=dict)
-
-    def get_subject_demand(self, subject, gender):
-        return self.demand[subject.lower()][gender]
+FEMALE, MALE = 1, 0  # gender codes, shared with the tutor data
 
 
 @dataclass
@@ -30,19 +21,32 @@ class ForecastResult:
     best_by_mae: str  # lowest-MAE model this run
     backtest_mae: dict
     forecast: pd.DataFrame  # columns: forecast, lower, upper; monthly index
+    n_windows: int  # backtest windows each model's MAE is based on
 
 
 # ---------- loading and validation ----------
 
-def load_series(path, date_col="month", value_col="hours"):
-    """Read a monthly demand CSV into a validated Series indexed by month start."""
+def load_subject_demand(path):
+    """Read one subject's demand CSV into a validated monthly series per gender.
+
+    File layout, one row per month, columns by position (header names ignored):
+    month, female hours, male hours. The subject is the file name: Maths.csv -> "maths".
+    Returns {(subject, gender): series indexed by month start}, ready for forecast_all_demand.
+    """
+    path = Path(path)
     df = pd.read_csv(path)
-    for col in (date_col, value_col):
-        if col not in df.columns:
-            raise ValueError(f"missing column: {col}")
-    dates = pd.to_datetime(df[date_col]).dt.to_period("M").dt.to_timestamp()
-    series = pd.Series(pd.to_numeric(df[value_col], errors="coerce").values, index=dates)
-    return validate_series(series.sort_index())
+    if df.shape[1] != 3:
+        raise ValueError(f"{path.name}: expected 3 columns (month, female, male), got {df.shape[1]}")
+    dates = pd.to_datetime(df.iloc[:, 0]).dt.to_period("M").dt.to_timestamp()
+    if dates.max() >= pd.Timestamp.today().to_period("M").to_timestamp():
+        raise ValueError(f"{path.name}: {dates.max():%Y-%m} is not over yet; "
+                         "leave it out until the month ends")
+    subject = path.stem.lower()
+    series = {}
+    for gender, col in ((FEMALE, 1), (MALE, 2)):
+        hours = pd.to_numeric(df.iloc[:, col], errors="raise").to_numpy()
+        series[(subject, gender)] = validate_series(pd.Series(hours, index=dates).sort_index())
+    return series
 
 
 def validate_series(series, min_length=MIN_TRAIN + 1):
@@ -63,13 +67,17 @@ def validate_series(series, min_length=MIN_TRAIN + 1):
 
 # ---------- models: each takes a training array and horizon, returns h forecasts ----------
 
+def _sf_forecast(model, y, h):
+    """Fit a statsforecast model to y and return its h point forecasts."""
+    return model.forecast(y=np.asarray(y, dtype=float), h=h)["mean"]
+
+
 def naive(y, h):
-    return np.repeat(y[-1], h)
+    return _sf_forecast(Naive(), y, h)
 
 
 def seasonal_naive(y, h):
-    last_season = y[-SEASON_LENGTH:]
-    return np.resize(last_season, h)
+    return _sf_forecast(SeasonalNaive(season_length=SEASON_LENGTH), y, h)
 
 
 def yoy_growth(y):
@@ -92,34 +100,22 @@ def seasonal_naive_growth(y, h):
     return seasonal_naive(y, h) * yoy_growth(y) ** years_ahead
 
 
-def linear_trend(y, h):
-    t = np.arange(len(y))
-    slope, intercept = np.polyfit(t, y, 1)
-    return intercept + slope * np.arange(len(y), len(y) + h)
-
-
 def damped_ets(y, h):
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", ConvergenceWarning)
-        fit = ExponentialSmoothing(y, trend="add", damped_trend=True).fit()
-    return np.asarray(fit.forecast(h))
+    """Damped Holt: additive error and trend, no seasonality."""
+    return _sf_forecast(AutoETS(model="AAN", damped=True), y, h)
 
 
 def holt_winters(y, h):
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", ConvergenceWarning)
-        fit = ExponentialSmoothing(
-            y, trend="add", damped_trend=True, seasonal="add",
-            seasonal_periods=SEASON_LENGTH, initialization_method="heuristic",
-        ).fit()
-    return np.asarray(fit.forecast(h))
+    """Damped Holt-Winters: additive error, trend and seasonality."""
+    if len(y) < 2 * SEASON_LENGTH:  # statsforecast would fit anyway, unreliably
+        raise ValueError(f"holt_winters needs at least {2 * SEASON_LENGTH} months")
+    return _sf_forecast(AutoETS(season_length=SEASON_LENGTH, model="AAA", damped=True), y, h)
 
 
 MODELS = {
     "naive": naive,
     "seasonal_naive": seasonal_naive,
     "seasonal_naive_growth": seasonal_naive_growth,
-    "linear_trend": linear_trend,
     "damped_ets": damped_ets,
     "holt_winters": holt_winters,
 }
@@ -191,12 +187,14 @@ def forecast_demand(series, h, coverage=0.8, min_train=MIN_TRAIN,
     table = pd.DataFrame(
         {"forecast": point, "lower": lower, "upper": upper}, index=index
     ).clip(lower=0)
-    return ForecastResult(model=model, best_by_mae=best, backtest_mae=mae, forecast=table)
+    return ForecastResult(model=model, best_by_mae=best, backtest_mae=mae, forecast=table,
+                          n_windows=len(errors[model]))
 
 
 # ---------- monthly run with model log ----------
 
-LOG_COLUMNS = (["run_date", "series", "last_month", "horizon", "model", "best_by_mae"]
+LOG_COLUMNS = (["run_date", "series", "last_month", "horizon", "model", "best_by_mae",
+                "forecast", "lower", "upper", "coverage", "switch_margin", "n_windows"]
                + [f"mae_{name}" for name in MODELS])
 
 
@@ -210,10 +208,13 @@ def read_previous_model(log_path, series_name, last_month):
     return None if earlier.empty else earlier["model"].iloc[-1]
 
 
-def append_log(log_path, series_name, last_month, h, result):
+def append_log(log_path, series_name, last_month, h, result, coverage, switch_margin):
+    first = result.forecast.iloc[0]  # first forecast month: the one recruitment uses
     row = {"run_date": date.today().isoformat(), "series": series_name,
            "last_month": last_month, "horizon": h, "model": result.model,
-           "best_by_mae": result.best_by_mae}
+           "best_by_mae": result.best_by_mae,
+           "forecast": first["forecast"], "lower": first["lower"], "upper": first["upper"],
+           "coverage": coverage, "switch_margin": switch_margin, "n_windows": result.n_windows}
     row.update({f"mae_{name}": round(v, 4) for name, v in result.backtest_mae.items()})
     path = Path(log_path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -227,5 +228,23 @@ def run_monthly_forecast(series, h, series_name, log_path, coverage=0.8, switch_
     previous = read_previous_model(log_path, series_name, last_month)
     result = forecast_demand(series, h, coverage,
                              previous_model=previous, switch_margin=switch_margin)
-    append_log(log_path, series_name, last_month, h, result)
+    append_log(log_path, series_name, last_month, h, result, coverage, switch_margin)
     return result
+
+
+def forecast_all_demand(series_by_key, log_path, h=1, column="forecast", **kwargs):
+    """Forecast every (subject, gender) series and build next month's demand.
+
+    series_by_key: {(subject, gender): monthly series}.
+    column: which forecast figure feeds demand: "forecast" (point), "lower" or "upper".
+    Returns ({subject: {gender: weekly hours}}, {(subject, gender): ForecastResult}).
+    """
+    if column not in ("forecast", "lower", "upper"):
+        raise ValueError(f"column must be forecast, lower or upper, not {column!r}")
+    demand, results = {}, {}
+    for (subject, gender), series in series_by_key.items():
+        subject = subject.lower()
+        result = run_monthly_forecast(series, h, f"{subject}_{gender}", log_path, **kwargs)
+        results[(subject, gender)] = result
+        demand.setdefault(subject, {})[gender] = float(result.forecast[column].iloc[0])
+    return demand, results

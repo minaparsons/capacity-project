@@ -9,8 +9,6 @@ from src.demand import (
     eligible_models,
     forecast_demand,
     holt_winters,
-    linear_trend,
-    load_series,
     naive,
     seasonal_naive,
     seasonal_naive_growth,
@@ -33,26 +31,13 @@ def trend_values(n=48):
     return 50 + 2.0 * np.arange(n)
 
 
+def levelling_seasonal_values(n=48):
+    """Growth that slows towards a ceiling, plus a yearly cycle."""
+    t = np.arange(n)
+    return 100 + 80 * (1 - 0.95 ** t) + 20 * np.sin(2 * np.pi * t / 12)
+
+
 # ---------- loading and validation ----------
-
-def test_load_series_reads_csv_and_normalises_dates(tmp_path):
-    path = tmp_path / "demand.csv"
-    dates = pd.date_range("2022-01-15", periods=30, freq="MS") + pd.Timedelta(days=14)
-    pd.DataFrame({"month": dates.strftime("%Y-%m-%d"), "hours": range(30)}).to_csv(path, index=False)
-
-    series = load_series(path)
-
-    assert len(series) == 30
-    assert series.index[0] == pd.Timestamp("2022-02-01")
-    assert series.index.freqstr == "MS"
-
-
-def test_load_series_rejects_missing_column(tmp_path):
-    path = tmp_path / "demand.csv"
-    pd.DataFrame({"month": ["2022-01-01"], "demand": [1]}).to_csv(path, index=False)
-    with pytest.raises(ValueError, match="missing column"):
-        load_series(path)
-
 
 def test_validate_accepts_clean_series():
     assert len(validate_series(monthly(trend_values(30)))) == 30
@@ -119,17 +104,12 @@ def test_seasonal_naive_growth_scales_last_year():
     np.testing.assert_allclose(forecast[12], 1.2 ** 3 * first_year[0])  # compounded
 
 
-def test_linear_trend_extrapolates_line():
-    np.testing.assert_allclose(linear_trend(trend_values(30), 3), [110.0, 112.0, 114.0])
-
-
 def test_damped_ets_flat_series_stays_flat():
     np.testing.assert_allclose(damped_ets(np.full(30, 40.0), 3), 40.0, atol=1e-6)
 
 
-def test_holt_winters_follows_trend_plus_season():
-    t = np.arange(39)
-    y = 100 + 2 * t + 20 * np.sin(2 * np.pi * t / 12)
+def test_holt_winters_follows_levelling_trend_plus_season():
+    y = levelling_seasonal_values(39)
     np.testing.assert_allclose(holt_winters(y[:36], 3), y[36:], rtol=0.02)
 
 
@@ -169,7 +149,7 @@ def test_all_models_share_backtest_origins():
 # ---------- backtesting and selection ----------
 
 def test_backtest_shape_and_zero_error_for_exact_model():
-    errors = backtest(trend_values(30), linear_trend, h=3, min_train=24)
+    errors = backtest(np.full(30, 50.0), naive, h=3, min_train=24)
     assert errors.shape == (4, 3)  # origins 24..27
     np.testing.assert_allclose(errors, 0, atol=1e-9)
 
@@ -184,7 +164,7 @@ def test_select_model_picks_seasonal_model_for_seasonal_data():
     best, mae, _ = select_model(seasonal_values(), h=3)
     assert best in {"seasonal_naive", "seasonal_naive_growth"}
     assert set(mae) == {"naive", "seasonal_naive", "seasonal_naive_growth",
-                        "linear_trend", "damped_ets", "holt_winters"}
+                        "damped_ets", "holt_winters"}
 
 
 def test_select_model_picks_growth_model_for_growing_seasonal_data_now():
@@ -193,15 +173,9 @@ def test_select_model_picks_growth_model_for_growing_seasonal_data_now():
     assert "holt_winters" not in mae
 
 
-def test_select_model_picks_holt_winters_for_growing_seasonal_data():
-    t = np.arange(48)
-    best, _, _ = select_model(100 + 2 * t + 20 * np.sin(2 * np.pi * t / 12), h=1)
+def test_select_model_picks_holt_winters_for_levelling_seasonal_data():
+    best, _, _ = select_model(levelling_seasonal_values(48), h=1)
     assert best == "holt_winters"
-
-
-def test_select_model_picks_linear_trend_for_straight_line():
-    best, _, _ = select_model(trend_values(), h=3)
-    assert best == "linear_trend"
 
 
 # ---------- end-to-end forecast ----------
@@ -220,7 +194,7 @@ def test_forecast_continues_monthly_index_with_ordered_intervals():
 
 
 def test_forecast_intervals_collapse_for_perfect_fit():
-    table = forecast_demand(monthly(trend_values()), h=3).forecast
+    table = forecast_demand(monthly(seasonal_values()), h=3).forecast  # seasonal_naive is exact
     np.testing.assert_allclose(table["upper"] - table["lower"], 0, atol=1e-9)
 
 
